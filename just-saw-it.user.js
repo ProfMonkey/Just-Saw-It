@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         刚刚刷到 - PC原型 v0.3
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.1
-// @description  只在知乎和小红书网页版首页，自动保存刚刚看到的信息流内容，刷新后可找回。记录只保存在本地。
+// @version      0.3.2
+// @description  在知乎和小红书网页版信息流中保存当前可见内容，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
 // @run-at       document-idle
@@ -14,15 +14,32 @@
 (() => {
   'use strict';
 
+  function hasXhsFeedCards() {
+    if (document.querySelector('section.note-item')) return true;
+    return Array.from(document.querySelectorAll('section')).some(section =>
+      section.querySelector('a[href*="/explore/"]')
+    );
+  }
+
   const zhihu = location.hostname === 'www.zhihu.com' && location.pathname === '/';
-  const xhs = location.hostname === 'www.xiaohongshu.com' &&
-    (location.pathname === '/' || location.pathname === '/explore');
+  const xhsHost = location.hostname === 'www.xiaohongshu.com';
+  const xhsRoute = xhsHost && (
+    location.pathname === '/' ||
+    location.pathname === '/explore' ||
+    location.pathname === '/explore/' ||
+    (/^\/explore\/[^/]+\/?$/.test(location.pathname) && hasXhsFeedCards())
+  );
+  const xhs = Boolean(xhsRoute);
   if (!zhihu && !xhs) return;
 
   const isHome = () =>
     (location.hostname === 'www.zhihu.com' && location.pathname === '/') ||
-    (location.hostname === 'www.xiaohongshu.com' &&
-      (location.pathname === '/' || location.pathname === '/explore'));
+    (location.hostname === 'www.xiaohongshu.com' && (
+      location.pathname === '/' ||
+      location.pathname === '/explore' ||
+      location.pathname === '/explore/' ||
+      (/^\/explore\/[^/]+\/?$/.test(location.pathname) && hasXhsFeedCards())
+    ));
 
   const SAVE_KEY = 'justseen_snapshots_v01';
   const LIMIT_KEY = 'justseen_limit_v01';
@@ -34,6 +51,7 @@
   const TEXT_MAX_LENGTH = 16000;
   const MIN_TEXT_LENGTH = 60;
   const MAX_VISIBLE_CARDS = 7;
+  const MAX_VISIBLE_XHS_CARDS = 15;
 
   const normalizeLimit = n => Number.isFinite(Number(n))
     ? Math.max(1, Math.min(100, Math.round(Number(n)))) : 20;
@@ -50,8 +68,8 @@
 
   function cardKey(card) {
     if (!card) return '';
-    if (card.id) return `id:${card.id}`;
-    if (card.url) return `url:${card.url}`;
+    if (card.id) return `id:${card.site || SITE}:${card.id}`;
+    if (card.url) return `url:${card.site || SITE}:${card.url}`;
     const title = normalizeForComparison(card.title);
     const text = normalizeForComparison(card.text);
     return title || text ? `text:${title}|${text}` : '';
@@ -83,8 +101,9 @@
     .entry{text-align:left;width:100%;display:block;background:white;border:0;border-bottom:1px solid #eff1f5;padding:9px 4px;color:#202b3e}.entry:hover{background:#f5f7fa}
     .date{display:block;font-size:11px;color:#7a8392;margin-bottom:2px}.title{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .preview{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#566174}
+    .author{display:block;font-size:11px;color:#7a8392;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     #details{display:none;margin-top:10px}#text{width:100%;height:230px;resize:vertical;padding:8px;border:1px solid #ccd4df;border-radius:7px;background:#fafcff;font:12px/1.5 monospace}
-    #url{width:100%;margin-top:7px;padding:7px;border:1px solid #ccd4df;border-radius:7px;background:#fafcff;font:11px/1.4 monospace}.hint{color:#718096;font-size:11px}
+    #url,#imageUrl{width:100%;margin-top:7px;padding:7px;border:1px solid #ccd4df;border-radius:7px;background:#fafcff;font:11px/1.4 monospace}.hint{color:#718096;font-size:11px}
   `;
   shadow.appendChild(style);
 
@@ -102,6 +121,7 @@
     <div class="hint" id="status"></div><div id="list"></div>
     <div id="details"><div class="row"><strong id="detailTitle"></strong><button class="small" id="copy">复制文字</button></div>
       <textarea id="text" readonly></textarea><input id="url" readonly placeholder="来源 URL">
+      <input id="imageUrl" readonly placeholder="封面图片 URL（如有）">
     </div>
     <p class="hint">刷新保护：主要保存刷新前刚刚看到的内容。自动记录：持续记录新的可见内容。所有记录只保存在本地。</p>
   `;
@@ -125,7 +145,9 @@
         ? `知乎首页 · 刷新保护 · 当前视口最多保存 ${MAX_VISIBLE_CARDS} 条`
         : `知乎首页 · 自动记录 · 当前视口最多处理 ${MAX_VISIBLE_CARDS} 条`;
     } else {
-      $('status').textContent = mode === 'protect' ? '小红书首页 · 刷新保护' : '小红书首页 · 自动记录';
+      $('status').textContent = mode === 'protect'
+        ? `小红书信息流 · 刷新保护 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`
+        : `小红书信息流 · 自动记录 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`;
     }
   }
 
@@ -170,6 +192,94 @@
     }).filter(Boolean);
   }
 
+
+  function getXhsNoteIdFromUrl(rawUrl) {
+    if (!rawUrl) return '';
+    try {
+      const parsed = new URL(rawUrl, location.origin);
+      const match = parsed.pathname.match(/\/explore\/([^/]+)/);
+      return match ? decodeURIComponent(match[1]) : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function getXhsCardCandidates() {
+    const primary = Array.from(document.querySelectorAll('section.note-item'));
+    if (primary.length) return primary;
+
+    // 备用策略：从包含笔记链接的 section 中识别每个唯一笔记 ID，
+    // 并为同一 ID 选择面积最大的候选 section，避免把整个列表当成一张卡片。
+    const byId = new Map();
+    for (const section of document.querySelectorAll('section')) {
+      const links = Array.from(section.querySelectorAll('a[href*="/explore/"]'));
+      const ids = Array.from(new Set(links.map(link => getXhsNoteIdFromUrl(link.href)).filter(Boolean)));
+      if (ids.length !== 1) continue;
+      const text = (section.innerText || '').trim();
+      if (!text && !section.querySelector('img')) continue;
+      const rect = section.getBoundingClientRect();
+      const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+      const previous = byId.get(ids[0]);
+      if (!previous || area > previous.area) byId.set(ids[0], { node: section, area });
+    }
+    return Array.from(byId.values(), item => item.node);
+  }
+
+  function extractXhsCards() {
+    const visible = [];
+    for (const card of getXhsCardCandidates()) {
+      const rect = card.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 ||
+          rect.bottom <= 0 || rect.top >= window.innerHeight ||
+          rect.right <= 0 || rect.left >= window.innerWidth) continue;
+
+      const link = card.querySelector('a[href*="/explore/"]');
+      const url = link?.href || '';
+      const noteId = getXhsNoteIdFromUrl(url) ||
+        card.getAttribute('data-note-id') ||
+        card.getAttribute('data-id') || '';
+
+      const titleNode = card.querySelector('.title') ||
+        card.querySelector('[class*="title"]') || link;
+      let title = titleNode?.innerText?.trim() ||
+        link?.getAttribute('aria-label')?.trim() || '';
+
+      const authorNode = card.querySelector('.author .name, .author-wrapper .name, .author-name, [class*="author"] .name');
+      const author = authorNode?.innerText?.trim() || '';
+
+      const images = Array.from(card.querySelectorAll('img')).map(img => {
+        const imageRect = img.getBoundingClientRect();
+        return {
+          url: img.currentSrc || img.src || img.getAttribute('data-src') ||
+            img.getAttribute('data-original') || '',
+          alt: img.alt || '',
+          area: Math.max(0, imageRect.width) * Math.max(0, imageRect.height)
+        };
+      }).filter(image => /^https?:\/\//i.test(image.url));
+      images.sort((a, b) => b.area - a.area);
+      const imageUrl = images[0]?.url || '';
+      if (!title) title = images[0]?.alt?.trim() || '';
+
+      const text = (card.innerText || '').replace(/\n{2,}/g, '\n').trim().slice(0, 1600);
+      if (!title && !text && !url && !imageUrl) continue;
+
+      const id = noteId || `${normalizeForComparison(title)}|${normalizeForComparison(author)}`;
+      visible.push({
+        card: { id, site: '小红书', time: Date.now(), title, author, text, url, imageUrl, kind: 'card' },
+        top: rect.top,
+        left: rect.left
+      });
+    }
+
+    visible.sort((a, b) => a.top - b.top || a.left - b.left);
+    const unique = new Map();
+    for (const item of visible) {
+      const key = cardKey(item.card);
+      if (key && !unique.has(key)) unique.set(key, item.card);
+    }
+    return Array.from(unique.values()).slice(0, MAX_VISIBLE_XHS_CARDS);
+  }
+
   function hasSavedCard(card) {
     const key = cardKey(card);
     return !key || savedCardKeys.has(key);
@@ -183,7 +293,8 @@
       const item = {
         id: card.id || `${Date.now()}-${Math.random().toString(36).slice(2,7)}`,
         site: card.site || SITE, time:Number.isFinite(card.time) ? card.time : Date.now(),
-        title:card.title || '', text:card.text || '', url:card.url || '', kind:'card'
+        title:card.title || '', author:card.author || '', text:card.text || '',
+        url:card.url || '', imageUrl:card.imageUrl || '', kind:'card'
       };
       history.unshift(item);
       savedCardKeys.add(key);
@@ -218,7 +329,8 @@
       const cards = extractZhihuCards();
       if (cards.length) saveCards(cards);
     } else {
-      capturePageText(force);
+      const cards = extractXhsCards();
+      if (cards.length) saveCards(cards);
     }
   }
 
@@ -230,9 +342,9 @@
         if (!cards.length) return;
         sessionStorage.setItem(TEMP_KEY, JSON.stringify({site:'知乎',time:Date.now(),cards}));
       } else {
-        const text = currentText();
-        if (text.length < MIN_TEXT_LENGTH) return;
-        sessionStorage.setItem(TEMP_KEY, JSON.stringify({site:SITE,time:Date.now(),text}));
+        const cards = extractXhsCards();
+        if (!cards.length) return;
+        sessionStorage.setItem(TEMP_KEY, JSON.stringify({site:'小红书',time:Date.now(),cards}));
       }
     } catch {}
   }
@@ -250,10 +362,11 @@
     if (!snapshot || snapshot.site !== SITE ||
         !Number.isFinite(snapshot.time) || Date.now() - snapshot.time > 30 * 60 * 1000) return;
 
-    if (SITE === '知乎' && Array.isArray(snapshot.cards)) {
+    if ((SITE === '知乎' || SITE === '小红书') && Array.isArray(snapshot.cards)) {
       saveCards(snapshot.cards);
       return;
     }
+    // 兼容升级前遗留的临时整页文字快照；新版本不会再创建此类小红书快照。
     if (typeof snapshot.text !== 'string' || snapshot.text.length < MIN_TEXT_LENGTH) return;
     const comparisonText = normalizeForComparison(snapshot.text);
     if (history.length && history[0].site === SITE &&
@@ -285,6 +398,12 @@
         title.className = 'title';
         title.textContent = item.title;
         entry.appendChild(title);
+        if (item.author) {
+          const author = document.createElement('span');
+          author.className = 'author';
+          author.textContent = item.author;
+          entry.appendChild(author);
+        }
         if (item.text) {
           const preview = document.createElement('span');
           preview.className = 'preview';
@@ -312,6 +431,7 @@
       : `${item.site} · ${new Date(item.time).toLocaleTimeString('zh-CN',{hour12:false})}`;
     $('text').value = item.text || '';
     $('url').value = item.url || '';
+    $('imageUrl').value = item.imageUrl || '';
   }
 
   launch.addEventListener('click', () => {
