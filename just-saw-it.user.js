@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         刚刚刷到 - PC测试版 v0.3.8
+// @name         刚刚刷到 - PC测试版 v0.4.0
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.8
+// @version      0.4.0
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
@@ -9,110 +9,140 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @noframes
 // ==/UserScript==
 
 (() => {
   'use strict';
 
-  const zhihu = location.hostname === 'www.zhihu.com' && location.pathname === '/';
-  const xhs = location.hostname === 'www.xiaohongshu.com' && (
-    location.pathname === '/' ||
-    location.pathname === '/explore' ||
-    location.pathname === '/explore/'
-  );
-  if (!zhihu && !xhs) return;
+  const IS_ZHIHU = location.hostname === 'www.zhihu.com';
+  const IS_XHS = location.hostname === 'www.xiaohongshu.com';
+  if (!IS_ZHIHU && !IS_XHS) return;
 
-  // 只在信息流首页运行；单篇笔记详情页不作为信息流处理。
-  const isHome = () =>
-    (location.hostname === 'www.zhihu.com' && location.pathname === '/') ||
-    (location.hostname === 'www.xiaohongshu.com' && (
-      location.pathname === '/' ||
-      location.pathname === '/explore' ||
-      location.pathname === '/explore/'
-    ));
-
-  // SAVE_KEY 只用于迁移旧数据；两个平台使用独立存储键，避免互相覆盖。
+  const SITE = IS_ZHIHU ? '知乎' : '小红书';
   const SAVE_KEY = 'justseen_snapshots_v01';
-  const ZHIHU_SAVE_KEY = 'justseen_snapshots_zhihu_v036';
-  const XHS_SAVE_KEY = 'justseen_snapshots_xhs_v036';
-  const SITE_SAVE_KEY = zhihu ? ZHIHU_SAVE_KEY : XHS_SAVE_KEY;
+  const LEGACY_ZHIHU_SAVE_KEY = 'justseen_snapshots_zhihu_v036';
+  const LEGACY_XHS_SAVE_KEY = 'justseen_snapshots_xhs_v036';
+  const LEGACY_SITE_SAVE_KEY = IS_ZHIHU ? LEGACY_ZHIHU_SAVE_KEY : LEGACY_XHS_SAVE_KEY;
+  const PAGE_KEY_PREFIX = 'justseen_page_history_v040_';
   const LIMIT_KEY = 'justseen_limit_v01';
   const PAUSE_KEY = 'justseen_pause_v01';
   const MODE_KEY = 'justseen_mode_v02';
-  const TEMP_KEY = 'justseen_reload_temp_v02';
-  const SITE = zhihu ? '知乎' : '小红书';
   const CHECK_INTERVAL_MS = 2000;
   const TEXT_MAX_LENGTH = 16000;
   const MIN_TEXT_LENGTH = 60;
   const MAX_VISIBLE_CARDS = 7;
   const MAX_VISIBLE_XHS_CARDS = 15;
+  const IGNORED_QUERY_PARAMS = new Set([
+    'xsec_token', 'xsec_source', 'source', 'from', 'channel_type',
+    'parent_page_channel_type', 'share_id', 'share_from', 'xhsshare',
+    'apptime', 'sharer_id', 'shareRedId'
+  ]);
   const IS_RELOAD_NAVIGATION = (() => {
     try { return performance.getEntriesByType('navigation')[0]?.type === 'reload'; }
     catch { return false; }
   })();
 
+  function canonicalizePageUrl(rawUrl = location.href) {
+    try {
+      const url = new URL(rawUrl, location.origin);
+      url.hash = '';
+      const params = Array.from(url.searchParams.entries())
+        .filter(([key]) => !IGNORED_QUERY_PARAMS.has(key.toLowerCase()))
+        .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
+      url.search = '';
+      for (const [key, value] of params) url.searchParams.append(key, value);
+      return url.origin + url.pathname + url.search;
+    } catch {
+      return location.origin + location.pathname;
+    }
+  }
+
+  function hashPageIdentity(value) {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x9747b28c;
+    for (let i = 0; i < value.length; i += 1) {
+      const code = value.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 0x01000193);
+      h2 = Math.imul(h2 ^ (code + i), 0x5bd1e995);
+    }
+    return (h1 >>> 0).toString(36) + '_' + (h2 >>> 0).toString(36);
+  }
+
+  function getPageContext() {
+    const url = canonicalizePageUrl();
+    const id = SITE + '|' + url;
+    return { id, url, storageKey: PAGE_KEY_PREFIX + hashPageIdentity(id) };
+  }
+
+  let pageContext = getPageContext();
+  let PAGE_SAVE_KEY = pageContext.storageKey;
+
   const normalizeLimit = n => Number.isFinite(Number(n))
     ? Math.max(1, Math.min(100, Math.round(Number(n)))) : 20;
   const normalizeForComparison = text => String(text || '').replace(/\s+/g, ' ').trim();
 
-  // 每个平台独立保留最多 limit 条，避免一个平台的新记录挤掉另一个平台的历史。
-  function trimHistoryPerSite(items, maxPerSite) {
-    const counts = new Map();
+  function trimHistoryPerPage(items, maxItems) {
     return (Array.isArray(items) ? items : [])
       .slice()
       .sort((a, b) => (Number(b.time) || 0) - (Number(a.time) || 0))
-      .filter(item => {
-        const site = item?.site || '未知站点';
-        const count = counts.get(site) || 0;
-        if (count >= maxPerSite) return false;
-        counts.set(site, count + 1);
-        return true;
-      });
+      .slice(0, maxItems);
   }
 
-  function ensureSiteStorageMigration() {
-    const legacy = GM_getValue(SAVE_KEY, []);
-    const legacyItems = Array.isArray(legacy) ? legacy : [];
-    const existingZhihu = GM_getValue(ZHIHU_SAVE_KEY, null);
-    const existingXhs = GM_getValue(XHS_SAVE_KEY, null);
-    const initialLimit = normalizeLimit(GM_getValue(LIMIT_KEY, 20));
-
-    if (!Array.isArray(existingZhihu)) {
-      GM_setValue(ZHIHU_SAVE_KEY,
-        trimHistoryPerSite(legacyItems.filter(item => item && item.site === '知乎'), initialLimit));
-    }
-    if (!Array.isArray(existingXhs)) {
-      GM_setValue(XHS_SAVE_KEY,
-        trimHistoryPerSite(legacyItems.filter(item => item && item.site === '小红书'), initialLimit));
+  function isLegacyHomePage(rawUrl) {
+    try {
+      const url = new URL(rawUrl);
+      return (IS_ZHIHU && url.pathname === '/') ||
+        (IS_XHS && ['/', '/explore', '/explore/'].includes(url.pathname));
+    } catch {
+      return false;
     }
   }
 
-  function readMergedHistory() {
-    const zhihuItems = GM_getValue(ZHIHU_SAVE_KEY, []);
-    const xhsItems = GM_getValue(XHS_SAVE_KEY, []);
-    const all = [
-      ...(Array.isArray(zhihuItems) ? zhihuItems : []),
-      ...(Array.isArray(xhsItems) ? xhsItems : [])
-    ];
-    const seen = new Set();
-    return all.filter(item => {
-      if (!item || typeof item !== 'object') return false;
-      const identity = String(item.site || '') + ':' + String(item.id || '') + ':' + String(item.time || '');
-      if (seen.has(identity)) return false;
-      seen.add(identity);
-      return true;
-    }).sort((a, b) => (Number(b.time) || 0) - (Number(a.time) || 0));
+  function ensurePageStorageMigration(context) {
+    const existing = GM_getValue(context.storageKey, null);
+    if (Array.isArray(existing)) {
+      const matching = existing.filter(item => !item?.pageId || item.pageId === context.id);
+      const trimmed = trimHistoryPerPage(matching, limit);
+      if (trimmed.length !== existing.length) GM_setValue(context.storageKey, trimmed);
+      return;
+    }
+
+    const siteItems = GM_getValue(LEGACY_SITE_SAVE_KEY, null);
+    const legacyItems = GM_getValue(SAVE_KEY, []);
+    const source = Array.isArray(siteItems) && siteItems.length
+      ? siteItems
+      : (Array.isArray(legacyItems) ? legacyItems : []);
+    const canMigrateOldHomeHistory = isLegacyHomePage(context.url);
+    const matching = source.filter(item => {
+      if (!item || item.site !== SITE) return false;
+      if (canMigrateOldHomeHistory && !item.pageId) return true;
+      return item.pageId === context.id ||
+        (item.pageUrl && canonicalizePageUrl(item.pageUrl) === context.url);
+    }).map(item => ({ ...item, pageId: context.id, pageUrl: context.url }));
+
+    GM_setValue(context.storageKey, trimHistoryPerPage(matching, limit));
   }
 
-  ensureSiteStorageMigration();
-  let history = readMergedHistory();
+  function readCurrentPageHistory() {
+    const stored = GM_getValue(PAGE_SAVE_KEY, []);
+    const matching = (Array.isArray(stored) ? stored : [])
+      .filter(item => !item?.pageId || item.pageId === pageContext.id);
+    return trimHistoryPerPage(matching, limit);
+  }
+
   let limit = normalizeLimit(GM_getValue(LIMIT_KEY, 20));
   let paused = Boolean(GM_getValue(PAUSE_KEY, false));
   let mode = GM_getValue(MODE_KEY, 'protect');
   if (mode !== 'protect' && mode !== 'auto') mode = 'protect';
+  let history = [];
   let selectedId = null;
   let lastText = '';
+  let pageStorageListenerId = null;
+
+  ensurePageStorageMigration(pageContext);
+  history = readCurrentPageHistory();
 
   function cardKey(card) {
     if (!card) return '';
@@ -133,9 +163,9 @@
     }
   }
 
-  // 不依赖标签页启动时的旧副本；保存前总是读取最新的共享历史。
+  // 只读取当前规范化 URL 对应的历史，其他页面（包括同站点其他知乎页面）互不混合。
   function refreshHistoryFromStorage() {
-    history = readMergedHistory();
+    history = readCurrentPageHistory();
     rebuildSavedCardKeys();
   }
 
@@ -197,19 +227,48 @@
   }
 
   function updateLaunch() {
-    const siteCount = history.filter(item => item.site === SITE).length;
-    launch.textContent = `🐒 历史 ${siteCount}${paused ? ' · 已暂停' : ''}`;
+    const pageCount = history.length;
+    launch.textContent = `🐒 本页历史 ${pageCount}${paused ? ' · 已暂停' : ''}`;
     $('pause').textContent = paused ? '继续' : '暂停';
     updateModeUI();
-    if (SITE === '知乎') {
-      $('status').textContent = mode === 'protect'
-        ? `知乎首页 · 刷新保护 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多保存 ${MAX_VISIBLE_CARDS} 条`
-        : `知乎首页 · 自动记录 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多处理 ${MAX_VISIBLE_CARDS} 条`;
-    } else {
-      $('status').textContent = mode === 'protect'
-        ? `小红书信息流 · 刷新保护 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`
-        : `小红书信息流 · 自动记录 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`;
+    let pageLabel = pageContext.url;
+    try {
+      const parsed = new URL(pageContext.url);
+      pageLabel = (parsed.pathname + parsed.search) || '/';
+    } catch {}
+    pageLabel = pageLabel.length > 88 ? pageLabel.slice(0, 85) + '…' : pageLabel;
+    const modeLabel = mode === 'protect' ? '刷新保护' : '自动记录';
+    const cardLimit = IS_ZHIHU ? MAX_VISIBLE_CARDS : MAX_VISIBLE_XHS_CARDS;
+    $('status').textContent =
+      `${SITE} · 当前页 ${pageLabel} · ${modeLabel} · 本页历史 ${pageCount} 条 · 当前视口最多处理 ${cardLimit} 条`;
+  }
+
+  function syncPageContext() {
+    const next = getPageContext();
+    if (next.id === pageContext.id) return false;
+
+    pageContext = next;
+    PAGE_SAVE_KEY = next.storageKey;
+    ensurePageStorageMigration(pageContext);
+    selectedId = null;
+    refreshHistoryFromStorage();
+    attachPageStorageListener();
+    updateLaunch();
+    if (panel.style.display === 'block') renderHistory();
+
+    // SPA 页面切换后，刷新保护模式也只在新页面首次成功抓到卡片时记录一次。
+    const expectedPageId = next.id;
+    if (mode === 'protect' && !paused) {
+      let attempts = 0;
+      const tryCaptureNewPage = () => {
+        if (pageContext.id !== expectedPageId || mode !== 'protect' || paused) return;
+        if (captureAutoCards(false)) return;
+        attempts += 1;
+        if (attempts < 16) setTimeout(tryCaptureNewPage, 500);
+      };
+      setTimeout(tryCaptureNewPage, 750);
     }
+    return true;
   }
 
   function currentText() {
@@ -342,6 +401,7 @@
       const item = {
         id: card.id || `${Date.now()}-${Math.random().toString(36).slice(2,7)}`,
         site: card.site || SITE, time:Number.isFinite(card.time) ? card.time : Date.now(),
+        pageId: pageContext.id, pageUrl: pageContext.url,
         title:card.title || '', author:card.author || '', text:card.text || '',
         url:card.url || '', imageUrl:card.imageUrl || '', kind:'card'
       };
@@ -350,89 +410,27 @@
       changed = true;
     }
     if (!changed) return;
-    history = trimHistoryPerSite(history, limit);
-    GM_setValue(SITE_SAVE_KEY, history.filter(item => item.site === SITE));
-    refreshHistoryFromStorage();
-    updateLaunch();
-    if (panel.style.display === 'block') renderHistory();
-  }
-
-  function capturePageText(force = false) {
-    if (!isHome() || (paused && !force)) return;
-    const text = currentText();
-    if (text.length < MIN_TEXT_LENGTH) return;
-    const comparisonText = normalizeForComparison(text);
-    if (!force && comparisonText === lastText) return;
-    lastText = comparisonText;
-    if (history.length && history[0].site === SITE &&
-        normalizeForComparison(history[0].text) === comparisonText) return;
-    history.unshift({id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,site:SITE,time:Date.now(),text});
-    history = trimHistoryPerSite(history, limit);
-    GM_setValue(SITE_SAVE_KEY, history.filter(item => item.site === SITE));
+    history = trimHistoryPerPage(history, limit);
+    GM_setValue(PAGE_SAVE_KEY, history);
     refreshHistoryFromStorage();
     updateLaunch();
     if (panel.style.display === 'block') renderHistory();
   }
 
   function captureAutoCards(force = false) {
-    if (!isHome() || (paused && !force)) return false;
-    const cards = SITE === '知乎' ? extractZhihuCards() : extractXhsCards();
+    syncPageContext();
+    if (paused && !force) return false;
+    const cards = IS_ZHIHU ? extractZhihuCards() : extractXhsCards();
     if (!cards.length) return false;
     saveCards(cards);
     return true;
   }
 
-  function saveReloadSnapshot() {
-    if (!isHome() || paused) return;
-    try {
-      if (SITE === '知乎') {
-        const cards = extractZhihuCards();
-        if (!cards.length) return;
-        sessionStorage.setItem(TEMP_KEY, JSON.stringify({site:'知乎',time:Date.now(),cards}));
-      } else {
-        const cards = extractXhsCards();
-        if (!cards.length) return;
-        sessionStorage.setItem(TEMP_KEY, JSON.stringify({site:'小红书',time:Date.now(),cards}));
-      }
-    } catch {}
-  }
-
-  function restoreReloadSnapshot() {
-    let raw;
-    try { raw = sessionStorage.getItem(TEMP_KEY); } catch { return false; }
-    if (!raw) return false;
-
-    // 先消费临时项，避免旧快照在后续导航中被重复使用。
-    try { sessionStorage.removeItem(TEMP_KEY); } catch {}
-
-    let snapshot;
-    try { snapshot = JSON.parse(raw); } catch { return false; }
-    if (!snapshot || snapshot.site !== SITE ||
-        !Number.isFinite(snapshot.time) ||
-        Date.now() - snapshot.time > 30 * 60 * 1000 ||
-        snapshot.time > Date.now() + 60 * 1000) return false;
-
-    // 只在浏览器确认是 reload 时恢复内容。
-    // 如果浏览器将本次导航报告为 navigate，但 pagehide 留下了有效快照，
-    // 仍返回 true，阻止启动时再保存一遍刷新后的首屏，避免数量瞬间从快照数跳到上限。
-    if (!IS_RELOAD_NAVIGATION) return true;
-
-    if ((SITE === '知乎' || SITE === '小红书') && Array.isArray(snapshot.cards)) {
-      saveCards(snapshot.cards);
-      return true;
-    }
-
-    // 兼容升级前遗留的临时整页文字快照。
-    if (typeof snapshot.text !== 'string' || snapshot.text.length < MIN_TEXT_LENGTH) return false;
-    const comparisonText = normalizeForComparison(snapshot.text);
-    if (history.length && history[0].site === SITE &&
-        normalizeForComparison(history[0].text) === comparisonText) return true;
-    history.unshift({id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,site:SITE,time:snapshot.time,text:snapshot.text});
-    history = trimHistoryPerSite(history, limit);
-    GM_setValue(SITE_SAVE_KEY, history.filter(item => item.site === SITE));
-    refreshHistoryFromStorage();
-    updateLaunch();
-    return true;
+  // 刷新/离开前直接保存当前页可见卡片。刷新后依靠卡片去重，不再用临时快照二次导入。
+  function saveVisibleCardsBeforeLeave() {
+    if (paused) return;
+    const cards = IS_ZHIHU ? extractZhihuCards() : extractXhsCards();
+    if (cards.length) saveCards(cards);
   }
 
   function renderHistory() {
@@ -506,13 +504,12 @@
   });
   $('save').addEventListener('click', () => captureAutoCards(true));
   $('clear').addEventListener('click', () => {
-    if (!confirm('确定清空「刚刚刷到」的全部记录吗？')) return;
+    if (!confirm('确定清空当前页面的全部历史吗？其他页面的历史不会受影响。')) return;
     history = [];
     selectedId = null;
     savedCardKeys.clear();
-    GM_setValue(ZHIHU_SAVE_KEY, []);
-    GM_setValue(XHS_SAVE_KEY, []);
-    GM_setValue(SAVE_KEY, []);
+    GM_setValue(PAGE_SAVE_KEY, []);
+    refreshHistoryFromStorage();
     renderHistory();
     updateLaunch();
   });
@@ -520,10 +517,8 @@
     limit = normalizeLimit($('limit').value);
     $('limit').value = String(limit);
     GM_setValue(LIMIT_KEY, limit);
-    const zhihuItems = GM_getValue(ZHIHU_SAVE_KEY, []);
-    const xhsItems = GM_getValue(XHS_SAVE_KEY, []);
-    GM_setValue(ZHIHU_SAVE_KEY, trimHistoryPerSite(Array.isArray(zhihuItems) ? zhihuItems : [], limit));
-    GM_setValue(XHS_SAVE_KEY, trimHistoryPerSite(Array.isArray(xhsItems) ? xhsItems : [], limit));
+    const pageItems = GM_getValue(PAGE_SAVE_KEY, []);
+    GM_setValue(PAGE_SAVE_KEY, trimHistoryPerPage(Array.isArray(pageItems) ? pageItems : [], limit));
     refreshHistoryFromStorage();
     updateLaunch();
     renderHistory();
@@ -548,38 +543,48 @@
     setTimeout(() => { $('copy').textContent = '复制文字'; }, 2500);
   });
 
-  // Tampermonkey 的同一脚本可在多个标签页共享 GM 存储；
-  // 监听远端历史变化，让另一个网站页面的计数与列表同步。
-  if (typeof GM_addValueChangeListener === 'function') {
-    const onSiteHistoryChange = (_key, _oldValue, _newValue, remote) => {
-      if (!remote) return;
+  // 同一规范化页面的多个标签页共享历史；不同 URL 使用不同存储键。
+  function attachPageStorageListener() {
+    if (typeof GM_addValueChangeListener !== 'function') return;
+    if (pageStorageListenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+      try { GM_removeValueChangeListener(pageStorageListenerId); } catch {}
+    }
+    const watchedKey = PAGE_SAVE_KEY;
+    pageStorageListenerId = GM_addValueChangeListener(watchedKey, (_key, _oldValue, _newValue, remote) => {
+      if (!remote || PAGE_SAVE_KEY !== watchedKey) return;
       refreshHistoryFromStorage();
       if (selectedId && !history.some(item => item.id === selectedId)) selectedId = null;
       updateLaunch();
       if (panel.style.display === 'block') renderHistory();
-    };
-    GM_addValueChangeListener(ZHIHU_SAVE_KEY, onSiteHistoryChange);
-    GM_addValueChangeListener(XHS_SAVE_KEY, onSiteHistoryChange);
+    });
+  }
+
+  if (typeof GM_addValueChangeListener === 'function') {
+    attachPageStorageListener();
     GM_addValueChangeListener(LIMIT_KEY, (_key, _oldValue, newValue, remote) => {
       if (!remote) return;
       limit = normalizeLimit(newValue);
       $('limit').value = String(limit);
+      const pageItems = GM_getValue(PAGE_SAVE_KEY, []);
+      GM_setValue(PAGE_SAVE_KEY, trimHistoryPerPage(Array.isArray(pageItems) ? pageItems : [], limit));
+      refreshHistoryFromStorage();
       updateLaunch();
+      if (panel.style.display === 'block') renderHistory();
     });
   }
 
-  window.addEventListener('pagehide', () => { if (mode === 'protect') saveReloadSnapshot(); });
+  window.addEventListener('pagehide', () => {
+    if (mode === 'protect') saveVisibleCardsBeforeLeave();
+  });
+
   updateLaunch();
-  const hadPendingReloadSnapshot = restoreReloadSnapshot();
+  setInterval(syncPageContext, 500);
   setInterval(() => { if (mode === 'auto') captureAutoCards(false); }, CHECK_INTERVAL_MS);
 
-  // 首次进入且没有待恢复快照时，刷新保护模式只保存首屏一次。
-  // 信息流可能晚于 document-idle 才渲染，因此若第一次没找到卡片，短暂重试；
-  // 一旦找到卡片就立即停止，避免多轮抓取把记录数推高。
-  // reload 或存在待恢复快照时不抓取刷新后的新首屏，保留刷新保护语义。
+  // 首次加载时等待信息流渲染；成功找到卡片即停止，避免重复计数。
   let initialCaptureAttempts = 0;
   function tryInitialCapture() {
-    if (mode === 'auto' || paused || IS_RELOAD_NAVIGATION || hadPendingReloadSnapshot) return;
+    if (mode === 'auto' || paused || IS_RELOAD_NAVIGATION) return;
     if (captureAutoCards(false)) return;
     initialCaptureAttempts += 1;
     if (initialCaptureAttempts < 16) setTimeout(tryInitialCapture, 500);
