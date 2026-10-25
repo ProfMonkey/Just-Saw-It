@@ -325,8 +325,8 @@
   }
 
   function getXhsCardCandidates() {
-    // 依据用户提供的真实小红书首页 DOM：每篇笔记对应一个 section.note-item。
-    // 不再用泛化的 section 选择器猜测，避免把页面其他区域误认成笔记。
+    // 依据用户提供的真实小红书 DOM：可识别笔记卡片使用 section.note-item。
+    // 不用泛化的 section 选择器，避免把页面其他区域误认成笔记。
     return Array.from(document.querySelectorAll('section.note-item'));
   }
 
@@ -439,7 +439,7 @@
     if (!history.length) {
       const empty = document.createElement('p');
       empty.className = 'hint';
-      empty.textContent = '还没有记录。请保持首页打开几秒钟，或者点击「立即记录」。';
+      empty.textContent = '当前页面还没有记录。请等待卡片加载，或点击「立即记录」。';
       list.appendChild(empty);
     }
     for (const item of history) {
