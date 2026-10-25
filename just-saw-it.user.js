@@ -1,13 +1,14 @@
 // ==UserScript==
-// @name         刚刚刷到 - PC原型 v0.3.3
+// @name         刚刚刷到 - PC原型 v0.3.4
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.3
+// @version      0.3.4
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @noframes
 // ==/UserScript==
 
@@ -66,10 +67,23 @@
   }
 
   const savedCardKeys = new Set();
-  for (const item of history) {
-    const key = cardKey(item);
-    if (key) savedCardKeys.add(key);
+
+  function rebuildSavedCardKeys() {
+    savedCardKeys.clear();
+    for (const item of history) {
+      const key = cardKey(item);
+      if (key) savedCardKeys.add(key);
+    }
   }
+
+  // 不依赖标签页启动时的旧副本；保存前总是读取最新的共享历史。
+  function refreshHistoryFromStorage() {
+    const latest = GM_getValue(SAVE_KEY, []);
+    history = Array.isArray(latest) ? latest : [];
+    rebuildSavedCardKeys();
+  }
+
+  rebuildSavedCardKeys();
 
   const host = document.createElement('div');
   host.id = 'justseen-pc-host';
@@ -261,6 +275,8 @@
   }
 
   function saveCards(cards) {
+    // 知乎与小红书可能分别开在不同标签页；先合并最新共享历史，避免旧标签页覆盖新记录。
+    refreshHistoryFromStorage();
     let changed = false;
     // extractor 按屏幕从上到下返回；反向 unshift 后，历史列表仍保持屏幕顺序。
     for (const card of Array.from(cards || []).reverse()) {
@@ -461,9 +477,31 @@
     setTimeout(() => { $('copy').textContent = '复制文字'; }, 2500);
   });
 
+  // Tampermonkey 的同一脚本可在多个标签页共享 GM 存储；
+  // 监听远端历史变化，让另一个网站页面的计数与列表同步。
+  if (typeof GM_addValueChangeListener === 'function') {
+    GM_addValueChangeListener(SAVE_KEY, (_key, _oldValue, newValue, remote) => {
+      if (!remote) return;
+      history = Array.isArray(newValue) ? newValue : [];
+      rebuildSavedCardKeys();
+      if (selectedId && !history.some(item => item.id === selectedId)) selectedId = null;
+      updateLaunch();
+      if (panel.style.display === 'block') renderHistory();
+    });
+    GM_addValueChangeListener(LIMIT_KEY, (_key, _oldValue, newValue, remote) => {
+      if (!remote) return;
+      limit = normalizeLimit(newValue);
+      $('limit').value = String(limit);
+      updateLaunch();
+    });
+  }
+
   window.addEventListener('pagehide', () => { if (mode === 'protect') saveReloadSnapshot(); });
   updateLaunch();
   restoreReloadSnapshot();
   setInterval(() => { if (mode === 'auto') captureAutoCards(false); }, CHECK_INTERVAL_MS);
-  setTimeout(() => { if (mode === 'auto') captureAutoCards(false); }, 750);
+
+  // 刷新保护模式启动时先保存首屏可见卡片一次；之后不随滚动持续记录。
+  // 页面离开/刷新前仍会暂存当时视口，刷新后补入新增卡片。
+  setTimeout(() => captureAutoCards(false), 750);
 })();
