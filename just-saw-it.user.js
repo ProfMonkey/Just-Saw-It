@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刚刚刷到 - PC测试版 v0.4.0
 // @namespace    https://example.invalid/just-seen
-// @version      0.4.0
+// @version      0.4.1
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
@@ -209,7 +209,7 @@
       <button class="small" id="pause">暂停</button><button class="small" id="save">立即记录</button><button class="small" id="clear">清空</button>
     </div>
     <div class="hint" id="status"></div><div id="list"></div>
-    <div id="details"><div class="row"><strong id="detailTitle"></strong><button class="small" id="copy">复制文字</button></div>
+    <div id="details"><div class="row"><strong id="detailTitle"></strong><button class="small" id="copy">复制标题</button></div>
       <textarea id="text" readonly></textarea><input id="url" readonly placeholder="来源 URL">
       <input id="imageUrl" readonly placeholder="封面图片 URL（如有）">
     </div>
@@ -533,14 +533,31 @@
     });
   });
   $('copy').addEventListener('click', async () => {
-    const txt = $('text').value;
-    try {
-      await navigator.clipboard.writeText(txt);
-      $('copy').textContent = '已复制';
-    } catch {
-      $('text').focus(); $('text').select(); $('copy').textContent = '已选中，请按 Ctrl+C';
+    const item = history.find(x => x.id === selectedId);
+    const title = (item?.title || '').trim();
+    if (!title) {
+      $('copy').textContent = '暂无标题';
+      setTimeout(() => { $('copy').textContent = '复制标题'; }, 2500);
+      return;
     }
-    setTimeout(() => { $('copy').textContent = '复制文字'; }, 2500);
+
+    try {
+      await navigator.clipboard.writeText(title);
+      $('copy').textContent = '标题已复制';
+    } catch {
+      const fallback = document.createElement('textarea');
+      fallback.value = title;
+      fallback.setAttribute('readonly', '');
+      fallback.style.position = 'fixed';
+      fallback.style.left = '-9999px';
+      document.body.appendChild(fallback);
+      fallback.select();
+      let copied = false;
+      try { copied = document.execCommand('copy'); } catch {}
+      fallback.remove();
+      $('copy').textContent = copied ? '标题已复制' : '复制失败，请手动复制';
+    }
+    setTimeout(() => { $('copy').textContent = '复制标题'; }, 2500);
   });
 
   // 同一规范化页面的多个标签页共享历史；不同 URL 使用不同存储键。
