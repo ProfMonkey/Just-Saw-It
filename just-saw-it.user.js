@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         刚刚刷到 - PC原型 v0.3.6
+// @name         刚刚刷到 - PC测试版 v0.3.7
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.6
+// @version      0.3.7
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
@@ -402,30 +402,40 @@
 
   function restoreReloadSnapshot() {
     let raw;
-    try { raw = sessionStorage.getItem(TEMP_KEY); } catch { return; }
-    if (!raw) return;
+    try { raw = sessionStorage.getItem(TEMP_KEY); } catch { return false; }
+    if (!raw) return false;
+
+    // 先消费临时项，避免旧快照在后续导航中被重复使用。
     try { sessionStorage.removeItem(TEMP_KEY); } catch {}
-    if (!IS_RELOAD_NAVIGATION) return;
 
     let snapshot;
-    try { snapshot = JSON.parse(raw); } catch { return; }
+    try { snapshot = JSON.parse(raw); } catch { return false; }
     if (!snapshot || snapshot.site !== SITE ||
-        !Number.isFinite(snapshot.time) || Date.now() - snapshot.time > 30 * 60 * 1000) return;
+        !Number.isFinite(snapshot.time) ||
+        Date.now() - snapshot.time > 30 * 60 * 1000 ||
+        snapshot.time > Date.now() + 60 * 1000) return false;
+
+    // 只在浏览器确认是 reload 时恢复内容。
+    // 如果浏览器将本次导航报告为 navigate，但 pagehide 留下了有效快照，
+    // 仍返回 true，阻止启动时再保存一遍刷新后的首屏，避免数量瞬间从快照数跳到上限。
+    if (!IS_RELOAD_NAVIGATION) return true;
 
     if ((SITE === '知乎' || SITE === '小红书') && Array.isArray(snapshot.cards)) {
       saveCards(snapshot.cards);
-      return;
+      return true;
     }
-    // 兼容升级前遗留的临时整页文字快照；新版本不会再创建此类小红书快照。
-    if (typeof snapshot.text !== 'string' || snapshot.text.length < MIN_TEXT_LENGTH) return;
+
+    // 兼容升级前遗留的临时整页文字快照。
+    if (typeof snapshot.text !== 'string' || snapshot.text.length < MIN_TEXT_LENGTH) return false;
     const comparisonText = normalizeForComparison(snapshot.text);
     if (history.length && history[0].site === SITE &&
-        normalizeForComparison(history[0].text) === comparisonText) return;
+        normalizeForComparison(history[0].text) === comparisonText) return true;
     history.unshift({id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,site:SITE,time:snapshot.time,text:snapshot.text});
     history = trimHistoryPerSite(history, limit);
     GM_setValue(SITE_SAVE_KEY, history.filter(item => item.site === SITE));
     refreshHistoryFromStorage();
     updateLaunch();
+    return true;
   }
 
   function renderHistory() {
@@ -563,14 +573,13 @@
 
   window.addEventListener('pagehide', () => { if (mode === 'protect') saveReloadSnapshot(); });
   updateLaunch();
-  restoreReloadSnapshot();
+  const hadPendingReloadSnapshot = restoreReloadSnapshot();
   setInterval(() => { if (mode === 'auto') captureAutoCards(false); }, CHECK_INTERVAL_MS);
 
-  // 刷新保护模式启动时先保存首屏可见卡片一次；之后不随滚动持续记录。
-  // 页面离开/刷新前仍会暂存当时视口，刷新后补入新增卡片。
+  // 首次进入且没有待恢复快照时，刷新保护模式保存首屏一次。
+  // 如果 pagehide 已留下快照，即使浏览器把导航类型报告为 navigate，也不立即再抓刷新后的首屏。
+  // 自动记录模式在 reload 后仍会由两秒轮询继续记录，不需要启动时重复抓取。
   setTimeout(() => {
-    // 刷新保护模式下，reload 已恢复刷新前快照；不能再把刷新后的新页面加进去。
-    // 普通首次进入仍保存首屏；自动记录模式仍按原逻辑运行。
-    if (mode === 'auto' || !IS_RELOAD_NAVIGATION) captureAutoCards(false);
+    if (!IS_RELOAD_NAVIGATION && !hadPendingReloadSnapshot) captureAutoCards(false);
   }, 750);
 })();
