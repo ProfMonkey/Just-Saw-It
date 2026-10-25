@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         刚刚刷到 - PC原型 v0.3.4
+// @name         刚刚刷到 - PC原型 v0.3.5
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.4
+// @version      0.3.5
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
@@ -43,10 +43,29 @@
   const MIN_TEXT_LENGTH = 60;
   const MAX_VISIBLE_CARDS = 7;
   const MAX_VISIBLE_XHS_CARDS = 15;
+  const IS_RELOAD_NAVIGATION = (() => {
+    try { return performance.getEntriesByType('navigation')[0]?.type === 'reload'; }
+    catch { return false; }
+  })();
 
   const normalizeLimit = n => Number.isFinite(Number(n))
     ? Math.max(1, Math.min(100, Math.round(Number(n)))) : 20;
   const normalizeForComparison = text => String(text || '').replace(/\s+/g, ' ').trim();
+
+  // 每个平台独立保留最多 limit 条，避免一个平台的新记录挤掉另一个平台的历史。
+  function trimHistoryPerSite(items, maxPerSite) {
+    const counts = new Map();
+    return (Array.isArray(items) ? items : [])
+      .slice()
+      .sort((a, b) => (Number(b.time) || 0) - (Number(a.time) || 0))
+      .filter(item => {
+        const site = item?.site || '未知站点';
+        const count = counts.get(site) || 0;
+        if (count >= maxPerSite) return false;
+        counts.set(site, count + 1);
+        return true;
+      });
+  }
 
   let history = GM_getValue(SAVE_KEY, []);
   if (!Array.isArray(history)) history = [];
@@ -141,17 +160,18 @@
   }
 
   function updateLaunch() {
-    launch.textContent = `🐒 历史 ${history.length}${paused ? ' · 已暂停' : ''}`;
+    const siteCount = history.filter(item => item.site === SITE).length;
+    launch.textContent = `🐒 历史 ${siteCount}${paused ? ' · 已暂停' : ''}`;
     $('pause').textContent = paused ? '继续' : '暂停';
     updateModeUI();
     if (SITE === '知乎') {
       $('status').textContent = mode === 'protect'
-        ? `知乎首页 · 刷新保护 · 当前视口最多保存 ${MAX_VISIBLE_CARDS} 条`
-        : `知乎首页 · 自动记录 · 当前视口最多处理 ${MAX_VISIBLE_CARDS} 条`;
+        ? `知乎首页 · 刷新保护 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多保存 ${MAX_VISIBLE_CARDS} 条`
+        : `知乎首页 · 自动记录 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多处理 ${MAX_VISIBLE_CARDS} 条`;
     } else {
       $('status').textContent = mode === 'protect'
-        ? `小红书信息流 · 刷新保护 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`
-        : `小红书信息流 · 自动记录 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`;
+        ? `小红书信息流 · 刷新保护 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`
+        : `小红书信息流 · 自动记录 · 本站 ${siteCount} 条 / 两站合计 ${history.length} 条 · 当前视口最多处理 ${MAX_VISIBLE_XHS_CARDS} 篇`;
     }
   }
 
@@ -293,7 +313,7 @@
       changed = true;
     }
     if (!changed) return;
-    history = history.slice(0, limit);
+    history = trimHistoryPerSite(history, limit);
     GM_setValue(SAVE_KEY, history);
     updateLaunch();
     if (panel.style.display === 'block') renderHistory();
@@ -309,7 +329,7 @@
     if (history.length && history[0].site === SITE &&
         normalizeForComparison(history[0].text) === comparisonText) return;
     history.unshift({id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,site:SITE,time:Date.now(),text});
-    history = history.slice(0, limit);
+    history = trimHistoryPerSite(history, limit);
     GM_setValue(SAVE_KEY, history);
     updateLaunch();
     if (panel.style.display === 'block') renderHistory();
@@ -346,8 +366,7 @@
     try { raw = sessionStorage.getItem(TEMP_KEY); } catch { return; }
     if (!raw) return;
     try { sessionStorage.removeItem(TEMP_KEY); } catch {}
-    const nav = performance.getEntriesByType('navigation')[0];
-    if (nav?.type !== 'reload') return;
+    if (!IS_RELOAD_NAVIGATION) return;
 
     let snapshot;
     try { snapshot = JSON.parse(raw); } catch { return; }
@@ -364,7 +383,7 @@
     if (history.length && history[0].site === SITE &&
         normalizeForComparison(history[0].text) === comparisonText) return;
     history.unshift({id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,site:SITE,time:snapshot.time,text:snapshot.text});
-    history = history.slice(0, limit);
+    history = trimHistoryPerSite(history, limit);
     GM_setValue(SAVE_KEY, history);
     updateLaunch();
   }
@@ -452,7 +471,7 @@
     limit = normalizeLimit($('limit').value);
     $('limit').value = String(limit);
     GM_setValue(LIMIT_KEY, limit);
-    history = history.slice(0, limit);
+    history = trimHistoryPerSite(history, limit);
     GM_setValue(SAVE_KEY, history);
     updateLaunch();
     renderHistory();
@@ -503,5 +522,9 @@
 
   // 刷新保护模式启动时先保存首屏可见卡片一次；之后不随滚动持续记录。
   // 页面离开/刷新前仍会暂存当时视口，刷新后补入新增卡片。
-  setTimeout(() => captureAutoCards(false), 750);
+  setTimeout(() => {
+    // 刷新保护模式下，reload 已恢复刷新前快照；不能再把刷新后的新页面加进去。
+    // 普通首次进入仍保存首屏；自动记录模式仍按原逻辑运行。
+    if (mode === 'auto' || !IS_RELOAD_NAVIGATION) captureAutoCards(false);
+  }, 750);
 })();
