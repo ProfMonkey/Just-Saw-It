@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         刚刚刷到 - PC原型 v0.3
+// @name         刚刚刷到 - PC原型 v0.3.3
 // @namespace    https://example.invalid/just-seen
 // @version      0.3.3
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
