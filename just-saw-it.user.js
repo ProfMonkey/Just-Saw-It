@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         刚刚刷到 - PC原型 v0.3
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.2
-// @description  在知乎和小红书网页版信息流中保存当前可见内容，刷新后可找回。记录只保存在本地。
+// @version      0.3.3
+// @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
 // @run-at       document-idle
@@ -14,31 +14,21 @@
 (() => {
   'use strict';
 
-  function hasXhsFeedCards() {
-    if (document.querySelector('section.note-item')) return true;
-    return Array.from(document.querySelectorAll('section')).some(section =>
-      section.querySelector('a[href*="/explore/"]')
-    );
-  }
-
   const zhihu = location.hostname === 'www.zhihu.com' && location.pathname === '/';
-  const xhsHost = location.hostname === 'www.xiaohongshu.com';
-  const xhsRoute = xhsHost && (
+  const xhs = location.hostname === 'www.xiaohongshu.com' && (
     location.pathname === '/' ||
     location.pathname === '/explore' ||
-    location.pathname === '/explore/' ||
-    (/^\/explore\/[^/]+\/?$/.test(location.pathname) && hasXhsFeedCards())
+    location.pathname === '/explore/'
   );
-  const xhs = Boolean(xhsRoute);
   if (!zhihu && !xhs) return;
 
+  // 只在信息流首页运行；单篇笔记详情页不作为信息流处理。
   const isHome = () =>
     (location.hostname === 'www.zhihu.com' && location.pathname === '/') ||
     (location.hostname === 'www.xiaohongshu.com' && (
       location.pathname === '/' ||
       location.pathname === '/explore' ||
-      location.pathname === '/explore/' ||
-      (/^\/explore\/[^/]+\/?$/.test(location.pathname) && hasXhsFeedCards())
+      location.pathname === '/explore/'
     ));
 
   const SAVE_KEY = 'justseen_snapshots_v01';
@@ -205,24 +195,9 @@
   }
 
   function getXhsCardCandidates() {
-    const primary = Array.from(document.querySelectorAll('section.note-item'));
-    if (primary.length) return primary;
-
-    // 备用策略：从包含笔记链接的 section 中识别每个唯一笔记 ID，
-    // 并为同一 ID 选择面积最大的候选 section，避免把整个列表当成一张卡片。
-    const byId = new Map();
-    for (const section of document.querySelectorAll('section')) {
-      const links = Array.from(section.querySelectorAll('a[href*="/explore/"]'));
-      const ids = Array.from(new Set(links.map(link => getXhsNoteIdFromUrl(link.href)).filter(Boolean)));
-      if (ids.length !== 1) continue;
-      const text = (section.innerText || '').trim();
-      if (!text && !section.querySelector('img')) continue;
-      const rect = section.getBoundingClientRect();
-      const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-      const previous = byId.get(ids[0]);
-      if (!previous || area > previous.area) byId.set(ids[0], { node: section, area });
-    }
-    return Array.from(byId.values(), item => item.node);
+    // 依据用户提供的真实小红书首页 DOM：每篇笔记对应一个 section.note-item。
+    // 不再用泛化的 section 选择器猜测，避免把页面其他区域误认成笔记。
+    return Array.from(document.querySelectorAll('section.note-item'));
   }
 
   function extractXhsCards() {
@@ -233,32 +208,32 @@
           rect.bottom <= 0 || rect.top >= window.innerHeight ||
           rect.right <= 0 || rect.left >= window.innerWidth) continue;
 
-      const link = card.querySelector('a[href*="/explore/"]');
+      // 优先使用标题链接，其次使用封面链接；避免先拿到隐藏的占位链接。
+      const titleLink = card.querySelector('a.title[href*="/explore/"]');
+      const coverLink = card.querySelector('a.cover[href*="/explore/"]');
+      const link = titleLink || coverLink ||
+        Array.from(card.querySelectorAll('a[href*="/explore/"]')).find(a => a.getClientRects().length > 0);
       const url = link?.href || '';
       const noteId = getXhsNoteIdFromUrl(url) ||
         card.getAttribute('data-note-id') ||
         card.getAttribute('data-id') || '';
 
-      const titleNode = card.querySelector('.title') ||
-        card.querySelector('[class*="title"]') || link;
+      const titleNode = titleLink || card.querySelector('.title') ||
+        card.querySelector('[class*="title"]');
       let title = titleNode?.innerText?.trim() ||
         link?.getAttribute('aria-label')?.trim() || '';
 
-      const authorNode = card.querySelector('.author .name, .author-wrapper .name, .author-name, [class*="author"] .name');
+      const authorNode = card.querySelector('.author-wrapper .name, .author .name, .author-name');
       const author = authorNode?.innerText?.trim() || '';
 
-      const images = Array.from(card.querySelectorAll('img')).map(img => {
-        const imageRect = img.getBoundingClientRect();
-        return {
-          url: img.currentSrc || img.src || img.getAttribute('data-src') ||
-            img.getAttribute('data-original') || '',
-          alt: img.alt || '',
-          area: Math.max(0, imageRect.width) * Math.max(0, imageRect.height)
-        };
-      }).filter(image => /^https?:\/\//i.test(image.url));
-      images.sort((a, b) => b.area - a.area);
-      const imageUrl = images[0]?.url || '';
-      if (!title) title = images[0]?.alt?.trim() || '';
+      // 只取笔记封面，不把作者头像误当作笔记图片。
+      const coverImage = card.querySelector('a.cover img[data-xhs-img], a.cover img, img[data-preload-cover]');
+      const imageUrl = coverImage
+        ? (coverImage.currentSrc || coverImage.src || coverImage.getAttribute('data-src') ||
+          coverImage.getAttribute('data-original') || '')
+        : '';
+      const imageAlt = coverImage?.alt?.trim() || '';
+      if (!title) title = imageAlt;
 
       const text = (card.innerText || '').replace(/\n{2,}/g, '\n').trim().slice(0, 1600);
       if (!title && !text && !url && !imageUrl) continue;
@@ -287,7 +262,8 @@
 
   function saveCards(cards) {
     let changed = false;
-    for (const card of cards || []) {
+    // extractor 按屏幕从上到下返回；反向 unshift 后，历史列表仍保持屏幕顺序。
+    for (const card of Array.from(cards || []).reverse()) {
       const key = cardKey(card);
       if (!key || hasSavedCard(card)) continue;
       const item = {
