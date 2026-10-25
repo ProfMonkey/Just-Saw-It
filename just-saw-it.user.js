@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         刚刚刷到 - PC测试版 v0.3.7
+// @name         刚刚刷到 - PC测试版 v0.3.8
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.7
+// @version      0.3.8
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
@@ -375,14 +375,11 @@
   }
 
   function captureAutoCards(force = false) {
-    if (!isHome() || (paused && !force)) return;
-    if (SITE === '知乎') {
-      const cards = extractZhihuCards();
-      if (cards.length) saveCards(cards);
-    } else {
-      const cards = extractXhsCards();
-      if (cards.length) saveCards(cards);
-    }
+    if (!isHome() || (paused && !force)) return false;
+    const cards = SITE === '知乎' ? extractZhihuCards() : extractXhsCards();
+    if (!cards.length) return false;
+    saveCards(cards);
+    return true;
   }
 
   function saveReloadSnapshot() {
@@ -576,10 +573,16 @@
   const hadPendingReloadSnapshot = restoreReloadSnapshot();
   setInterval(() => { if (mode === 'auto') captureAutoCards(false); }, CHECK_INTERVAL_MS);
 
-  // 首次进入且没有待恢复快照时，刷新保护模式保存首屏一次。
-  // 如果 pagehide 已留下快照，即使浏览器把导航类型报告为 navigate，也不立即再抓刷新后的首屏。
-  // 自动记录模式在 reload 后仍会由两秒轮询继续记录，不需要启动时重复抓取。
-  setTimeout(() => {
-    if (!IS_RELOAD_NAVIGATION && !hadPendingReloadSnapshot) captureAutoCards(false);
-  }, 750);
+  // 首次进入且没有待恢复快照时，刷新保护模式只保存首屏一次。
+  // 信息流可能晚于 document-idle 才渲染，因此若第一次没找到卡片，短暂重试；
+  // 一旦找到卡片就立即停止，避免多轮抓取把记录数推高。
+  // reload 或存在待恢复快照时不抓取刷新后的新首屏，保留刷新保护语义。
+  let initialCaptureAttempts = 0;
+  function tryInitialCapture() {
+    if (mode === 'auto' || paused || IS_RELOAD_NAVIGATION || hadPendingReloadSnapshot) return;
+    if (captureAutoCards(false)) return;
+    initialCaptureAttempts += 1;
+    if (initialCaptureAttempts < 16) setTimeout(tryInitialCapture, 500);
+  }
+  setTimeout(tryInitialCapture, 750);
 })();
