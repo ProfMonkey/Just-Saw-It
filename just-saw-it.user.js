@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         刚刚刷到 - PC原型 v0.3.5
+// @name         刚刚刷到 - PC原型 v0.3.6
 // @namespace    https://example.invalid/just-seen
-// @version      0.3.5
+// @version      0.3.6
 // @description  在知乎和小红书网页版信息流中保存当前可见的推荐卡片，刷新后可找回。记录只保存在本地。
 // @match        https://www.zhihu.com/*
 // @match        https://www.xiaohongshu.com/*
@@ -32,7 +32,11 @@
       location.pathname === '/explore/'
     ));
 
+  // SAVE_KEY 只用于迁移旧数据；两个平台使用独立存储键，避免互相覆盖。
   const SAVE_KEY = 'justseen_snapshots_v01';
+  const ZHIHU_SAVE_KEY = 'justseen_snapshots_zhihu_v036';
+  const XHS_SAVE_KEY = 'justseen_snapshots_xhs_v036';
+  const SITE_SAVE_KEY = zhihu ? ZHIHU_SAVE_KEY : XHS_SAVE_KEY;
   const LIMIT_KEY = 'justseen_limit_v01';
   const PAUSE_KEY = 'justseen_pause_v01';
   const MODE_KEY = 'justseen_mode_v02';
@@ -67,8 +71,42 @@
       });
   }
 
-  let history = GM_getValue(SAVE_KEY, []);
-  if (!Array.isArray(history)) history = [];
+  function ensureSiteStorageMigration() {
+    const legacy = GM_getValue(SAVE_KEY, []);
+    const legacyItems = Array.isArray(legacy) ? legacy : [];
+    const existingZhihu = GM_getValue(ZHIHU_SAVE_KEY, null);
+    const existingXhs = GM_getValue(XHS_SAVE_KEY, null);
+    const initialLimit = normalizeLimit(GM_getValue(LIMIT_KEY, 20));
+
+    if (!Array.isArray(existingZhihu)) {
+      GM_setValue(ZHIHU_SAVE_KEY,
+        trimHistoryPerSite(legacyItems.filter(item => item && item.site === '知乎'), initialLimit));
+    }
+    if (!Array.isArray(existingXhs)) {
+      GM_setValue(XHS_SAVE_KEY,
+        trimHistoryPerSite(legacyItems.filter(item => item && item.site === '小红书'), initialLimit));
+    }
+  }
+
+  function readMergedHistory() {
+    const zhihuItems = GM_getValue(ZHIHU_SAVE_KEY, []);
+    const xhsItems = GM_getValue(XHS_SAVE_KEY, []);
+    const all = [
+      ...(Array.isArray(zhihuItems) ? zhihuItems : []),
+      ...(Array.isArray(xhsItems) ? xhsItems : [])
+    ];
+    const seen = new Set();
+    return all.filter(item => {
+      if (!item || typeof item !== 'object') return false;
+      const identity = String(item.site || '') + ':' + String(item.id || '') + ':' + String(item.time || '');
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    }).sort((a, b) => (Number(b.time) || 0) - (Number(a.time) || 0));
+  }
+
+  ensureSiteStorageMigration();
+  let history = readMergedHistory();
   let limit = normalizeLimit(GM_getValue(LIMIT_KEY, 20));
   let paused = Boolean(GM_getValue(PAUSE_KEY, false));
   let mode = GM_getValue(MODE_KEY, 'protect');
@@ -97,8 +135,7 @@
 
   // 不依赖标签页启动时的旧副本；保存前总是读取最新的共享历史。
   function refreshHistoryFromStorage() {
-    const latest = GM_getValue(SAVE_KEY, []);
-    history = Array.isArray(latest) ? latest : [];
+    history = readMergedHistory();
     rebuildSavedCardKeys();
   }
 
@@ -314,7 +351,8 @@
     }
     if (!changed) return;
     history = trimHistoryPerSite(history, limit);
-    GM_setValue(SAVE_KEY, history);
+    GM_setValue(SITE_SAVE_KEY, history.filter(item => item.site === SITE));
+    refreshHistoryFromStorage();
     updateLaunch();
     if (panel.style.display === 'block') renderHistory();
   }
@@ -330,7 +368,8 @@
         normalizeForComparison(history[0].text) === comparisonText) return;
     history.unshift({id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,site:SITE,time:Date.now(),text});
     history = trimHistoryPerSite(history, limit);
-    GM_setValue(SAVE_KEY, history);
+    GM_setValue(SITE_SAVE_KEY, history.filter(item => item.site === SITE));
+    refreshHistoryFromStorage();
     updateLaunch();
     if (panel.style.display === 'block') renderHistory();
   }
@@ -384,7 +423,8 @@
         normalizeForComparison(history[0].text) === comparisonText) return;
     history.unshift({id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,site:SITE,time:snapshot.time,text:snapshot.text});
     history = trimHistoryPerSite(history, limit);
-    GM_setValue(SAVE_KEY, history);
+    GM_setValue(SITE_SAVE_KEY, history.filter(item => item.site === SITE));
+    refreshHistoryFromStorage();
     updateLaunch();
   }
 
@@ -463,7 +503,9 @@
     history = [];
     selectedId = null;
     savedCardKeys.clear();
-    GM_setValue(SAVE_KEY, history);
+    GM_setValue(ZHIHU_SAVE_KEY, []);
+    GM_setValue(XHS_SAVE_KEY, []);
+    GM_setValue(SAVE_KEY, []);
     renderHistory();
     updateLaunch();
   });
@@ -471,8 +513,11 @@
     limit = normalizeLimit($('limit').value);
     $('limit').value = String(limit);
     GM_setValue(LIMIT_KEY, limit);
-    history = trimHistoryPerSite(history, limit);
-    GM_setValue(SAVE_KEY, history);
+    const zhihuItems = GM_getValue(ZHIHU_SAVE_KEY, []);
+    const xhsItems = GM_getValue(XHS_SAVE_KEY, []);
+    GM_setValue(ZHIHU_SAVE_KEY, trimHistoryPerSite(Array.isArray(zhihuItems) ? zhihuItems : [], limit));
+    GM_setValue(XHS_SAVE_KEY, trimHistoryPerSite(Array.isArray(xhsItems) ? xhsItems : [], limit));
+    refreshHistoryFromStorage();
     updateLaunch();
     renderHistory();
   });
@@ -499,14 +544,15 @@
   // Tampermonkey 的同一脚本可在多个标签页共享 GM 存储；
   // 监听远端历史变化，让另一个网站页面的计数与列表同步。
   if (typeof GM_addValueChangeListener === 'function') {
-    GM_addValueChangeListener(SAVE_KEY, (_key, _oldValue, newValue, remote) => {
+    const onSiteHistoryChange = (_key, _oldValue, _newValue, remote) => {
       if (!remote) return;
-      history = Array.isArray(newValue) ? newValue : [];
-      rebuildSavedCardKeys();
+      refreshHistoryFromStorage();
       if (selectedId && !history.some(item => item.id === selectedId)) selectedId = null;
       updateLaunch();
       if (panel.style.display === 'block') renderHistory();
-    });
+    };
+    GM_addValueChangeListener(ZHIHU_SAVE_KEY, onSiteHistoryChange);
+    GM_addValueChangeListener(XHS_SAVE_KEY, onSiteHistoryChange);
     GM_addValueChangeListener(LIMIT_KEY, (_key, _oldValue, newValue, remote) => {
       if (!remote) return;
       limit = normalizeLimit(newValue);
